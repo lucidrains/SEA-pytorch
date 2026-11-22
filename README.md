@@ -1,6 +1,7 @@
+
 ## SEA-pytorch (wip)
 
-Explorations into [Scaling Empowered Agents](https://arxiv.org/abs/2610.13002), from Catherine Ji et al. of Eysenbach's group
+Explorations into [Scaling Empowered Agents](https://arxiv.org/abs/2610.13002), from [Catherine Ji](https://cj7280.github.io/cathyji/) et al. of Benjamin Eysenbach's group
 
 ## Citations
 
