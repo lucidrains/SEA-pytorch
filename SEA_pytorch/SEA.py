@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
+
 import torch
-from torch import nn, is_tensor, Tensor
+from torch import nn, arange, cat, is_tensor, rand, randn, tensor, where, Tensor
 from torch.nn import Module, ModuleList
 import torch.nn.functional as F
 
@@ -9,7 +11,7 @@ import torch.nn.functional as F
 
 import einx
 from einops import einsum, rearrange, repeat, pack, unpack
-from torch_einops_utils import cast_tensor
+from torch_einops_utils import cast_tensor, clamp, device_dtype as dd
 from torch_einops_utils.shape import size, shape
 
 # functions
@@ -22,6 +24,9 @@ def default(v, d):
 
 def cast_tuple(t, length = 1):
     return t if isinstance(t, tuple) else ((t,) * length)
+
+def l2norm(t):
+    return F.normalize(t, dim = -1)
 
 # truncated geometric sampling
 
@@ -50,9 +55,9 @@ def sample_truncated_geometric(
 
     if exists(rand_uniform):
         out_shape = torch.broadcast_shapes(out_shape, rand_uniform.shape)
-        rand_uniform = rand_uniform.to(device = device, dtype = torch.float32).expand(out_shape)
+        rand_uniform = rand_uniform.to(**dd(discount)).expand(out_shape)
     else:
-        rand_uniform = torch.rand(out_shape, device = device, dtype = torch.float32, generator = generator)
+        rand_uniform = rand(out_shape, **dd(discount), generator = generator)
 
     # inverse cdf
 
@@ -62,18 +67,18 @@ def sample_truncated_geometric(
     is_zero = discount == 0.
     is_undiscounted = discount == 1.
 
-    safe_discount = torch.where(is_zero | is_undiscounted, 0.5, discount)
+    safe_discount = where(is_zero | is_undiscounted, 0.5, discount)
 
-    log_discount = torch.where(safe_discount < 0.5, safe_discount.log(), torch.log1p(safe_discount - 1.))
+    log_discount = where(safe_discount < 0.5, safe_discount.log(), torch.log1p(safe_discount - 1.))
     prob_reach = -torch.expm1(num_steps * log_discount)
 
-    delta = torch.where(
+    delta = where(
         is_undiscounted,
         rand_uniform * num_steps,
         torch.log1p(-rand_uniform * prob_reach) / log_discount
     )
 
-    delta = torch.where(is_zero, 0., delta)
+    delta = where(is_zero, 0., delta)
 
     # clamp before long cast
 
@@ -104,11 +109,112 @@ def bilinear_contrastive(
     shape(skill, 'b d', b = batch, d = dim)
 
     logits = einsum(delta, skill, 'i d, j d -> i j') / temperature
-    labels = torch.arange(batch, device = delta.device)
+    labels = arange(batch, device = delta.device)
 
     return F.cross_entropy(logits, labels)
 
+# skill prior and effective reward
+
+def sample_skills(
+    sample_shape: tuple[int, ...] | int,
+    dim_skill: int,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32
+) -> Tensor:
+    return l2norm(randn((*cast_tuple(sample_shape), dim_skill), device = device, dtype = dtype))
+
+def effective_reward(
+    anchor_embed: Tensor,
+    next_embed: Tensor,
+    skill: Tensor,
+    *,
+    temperature: float = 0.1,
+    partition_weight: float = 1.,
+    num_samples: int = 1024
+) -> Tensor:
+    assert 0. <= partition_weight <= 1.
+
+    pos = bilinear_contrastive(anchor_embed, next_embed, skill, temperature = temperature, return_loss = False)
+
+    if partition_weight == 0.:
+        return pos
+
+    assert num_samples >= 2
+
+    # negative skills on sphere
+
+    dim = size(anchor_embed, '... [d]')
+    neg_skills = sample_skills(num_samples - 1, dim, **dd(anchor_embed))
+
+    neg = einsum(next_embed - anchor_embed, neg_skills, '... d, k d -> ... k') / temperature
+
+    # log mean exp over pos and negs
+
+    logits = cat((rearrange(pos, '... -> ... 1'), neg), dim = -1)
+    log_partition = logits.logsumexp(dim = -1) - math.log(num_samples)
+
+    return pos - partition_weight * log_partition
+
 # classes
+
+class EffectiveReward(Module):
+    def __init__(
+        self,
+        total_steps: int,
+        *,
+        anneal_fracs: tuple[float, float] = (0.3, 0.8),
+        temperature: float = 0.1,
+        num_samples: int = 1024
+    ):
+        super().__init__()
+        start, end = anneal_fracs
+        assert total_steps > 0 and 0. <= start <= end <= 1.
+
+        self.total_steps = total_steps
+        self.anneal_fracs = anneal_fracs
+        self.temperature = temperature
+        self.num_samples = num_samples
+
+        self.register_buffer('step', tensor(0))
+
+    def set_step_(self, step: int):
+        assert step >= 0
+        self.step.fill_(step)
+        return self
+
+    @property
+    def partition_weight(self) -> float:
+        start, end = self.anneal_fracs
+        progress = self.step.item() / self.total_steps
+
+        if start == end:
+            return float(progress >= end)
+
+        return clamp((progress - start) / (end - start), 0., 1.)
+
+    def forward(
+        self,
+        anchor_embed: Tensor,
+        next_embed: Tensor,
+        skill: Tensor,
+        *,
+        partition_weight: float | None = None,
+        increment_step: bool | int = True
+    ) -> Tensor:
+        reward = effective_reward(
+            anchor_embed,
+            next_embed,
+            skill,
+            temperature = self.temperature,
+            partition_weight = default(partition_weight, self.partition_weight),
+            num_samples = self.num_samples
+        )
+
+        if self.training and increment_step:
+            self.step += int(increment_step)
+
+        return reward
 
 class SEA(Module):
     def __init__(

@@ -1,6 +1,6 @@
 [project]
 name = "SEA-pytorch"
-version = "0.0.2"
+version = "0.0.3"
 description = "Explorations into Scaling Empowered Agents"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -27,7 +27,7 @@ dependencies = [
     "einops>=0.8.1",
     "einx>=0.4.0",
     "torch>=2.5",
-    "torch-einops-utils>=0.2.8"
+    "torch-einops-utils>=0.2.9"
 ]
 
 [project.urls]

@@ -1,3 +1,4 @@
+import math
 import pytest
 import torch
 import torch.nn.functional as F
@@ -7,7 +8,10 @@ param = pytest.mark.parametrize
 from SEA_pytorch import (
     SEA,
     sample_truncated_geometric,
-    bilinear_contrastive
+    bilinear_contrastive,
+    sample_skills,
+    effective_reward,
+    EffectiveReward
 )
 
 def test_sea():
@@ -53,3 +57,43 @@ def test_bilinear_contrastive():
 
     loss.backward()
     assert embed.grad is not None and future_embed.grad is not None
+
+def test_effective_reward():
+    anchor = torch.randn(8, 16)
+    next_embed = torch.randn(8, 16)
+    skill = sample_skills(8, 16)
+
+    assert torch.allclose(skill.norm(dim = -1), torch.ones(8), atol = 1e-5)
+
+    # schedule: 0 up to 30%, linear to 1 at 80%, 1 thereafter
+
+    reward_fn = EffectiveReward(total_steps = 100, num_samples = 64)
+
+    assert reward_fn.partition_weight == 0.
+    r0 = reward_fn(anchor, next_embed, skill, increment_step = 30)
+    assert r0.shape == (8,)
+    assert torch.allclose(r0, bilinear_contrastive(anchor, next_embed, skill, return_loss = False))
+
+    assert reward_fn.partition_weight == 0.
+    reward_fn(anchor, next_embed, skill, increment_step = 25)
+    assert math.isclose(reward_fn.partition_weight, 0.5)
+
+    reward_fn(anchor, next_embed, skill, increment_step = 25)
+    assert reward_fn.partition_weight == 1.
+
+    # bounded above by log(K) when partition_weight == 1
+
+    r1 = reward_fn(anchor, anchor + skill * 10., skill, increment_step = False)
+    assert (r1 <= math.log(64) + 1e-5).all()
+    assert reward_fn.step.item() == 80
+
+    # eval mode does not increment step
+
+    reward_fn.eval()
+    reward_fn(anchor, next_embed, skill)
+    assert reward_fn.step.item() == 80
+
+    # set_step_
+
+    reward_fn.set_step_(55)
+    assert math.isclose(reward_fn.partition_weight, 0.5)
