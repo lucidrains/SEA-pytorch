@@ -8,7 +8,7 @@ import torch.nn.functional as F
 # ein equations
 
 import einx
-from einops import rearrange, repeat, pack, unpack
+from einops import einsum, rearrange, repeat, pack, unpack
 from torch_einops_utils import cast_tensor
 from torch_einops_utils.shape import size, shape
 
@@ -80,6 +80,33 @@ def sample_truncated_geometric(
     delta = delta.floor().clamp(min = 0.).minimum(max_zero_based).long().minimum(max_zero_based)
 
     return delta if allow_zero else (delta + 1)
+
+# bilinear contrastive learning
+
+def bilinear_contrastive(
+    embed: Tensor,
+    future_embed: Tensor,
+    skill: Tensor,
+    *,
+    temperature: float = 0.1,
+    return_loss: bool = True
+) -> Tensor:
+    assert temperature > 0.
+
+    delta = future_embed - embed
+
+    if not return_loss:
+        return einsum(delta, skill, '... d, ... d -> ...') / temperature
+
+    # asymmetric infonce over skills
+
+    batch, dim = shape(delta, 'b d')
+    shape(skill, 'b d', b = batch, d = dim)
+
+    logits = einsum(delta, skill, 'i d, j d -> i j') / temperature
+    labels = torch.arange(batch, device = delta.device)
+
+    return F.cross_entropy(logits, labels)
 
 # classes
 

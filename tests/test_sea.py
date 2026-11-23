@@ -1,11 +1,13 @@
 import pytest
 import torch
+import torch.nn.functional as F
 
 param = pytest.mark.parametrize
 
 from SEA_pytorch import (
     SEA,
-    sample_truncated_geometric
+    sample_truncated_geometric,
+    bilinear_contrastive
 )
 
 def test_sea():
@@ -37,3 +39,17 @@ def test_sample_truncated_geometric():
     expected = (0.85 ** torch.arange(8, dtype = torch.float32))
     expected = expected / expected.sum()
     assert (empirical - expected).abs().max() < 0.01
+
+def test_bilinear_contrastive():
+    embed = torch.randn(8, 16, requires_grad = True)
+    future_embed = torch.randn(8, 16, requires_grad = True)
+    skill = F.normalize(torch.randn(8, 16), dim = -1)
+
+    score = bilinear_contrastive(embed, future_embed, skill, return_loss = False)
+    assert score.shape == (8,)
+
+    loss = bilinear_contrastive(embed, future_embed, skill)
+    assert loss.ndim == 0
+
+    loss.backward()
+    assert embed.grad is not None and future_embed.grad is not None
