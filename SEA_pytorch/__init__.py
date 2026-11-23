@@ -1,3 +1,4 @@
 from SEA_pytorch.SEA import (
-    SEA
+    SEA,
+    sample_truncated_geometric
 )
