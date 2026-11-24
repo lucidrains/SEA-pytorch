@@ -4,7 +4,7 @@ import math
 from collections.abc import Callable
 
 import torch
-from torch import nn, arange, cat, is_tensor, rand, randn, randn_like, tensor, where, Tensor
+from torch import nn, arange, cat, is_tensor, rand, randn, randn_like, stack, tensor, where, Tensor
 from torch.nn import Module, ModuleList
 import torch.nn.functional as F
 
@@ -12,7 +12,14 @@ import torch.nn.functional as F
 
 import einx
 from einops import einsum, rearrange, repeat, pack, unpack
-from torch_einops_utils import cast_tensor, clamp, device_dtype as dd
+from torch_einops_utils import (
+    batched_index_select,
+    cast_tensor,
+    clamp,
+    device_dtype as dd,
+    pad_right_ndim_to,
+    repeat_interleave_to_match
+)
 from torch_einops_utils.shape import size, shape
 
 # functions
@@ -31,6 +38,40 @@ def cast_tuple(t, length = 1):
 
 def l2norm(t):
     return F.normalize(t, dim = -1)
+
+# causal state / action chunking
+
+def causal_chunks(
+    seq: Tensor,
+    chunk_len: int,
+    *,
+    indices: Tensor | int | None = None,
+    stride: int = 1,
+    offset: int = 0,
+    pad_value: float | int | None = None,
+    return_mask: bool = False
+) -> Tensor | tuple[Tensor, Tensor]:
+    assert chunk_len >= 1 and stride >= 1
+
+    batch, seq_len = shape(seq, '[b] [t] ...')
+    device = seq.device
+
+    if not exists(indices):
+        t = repeat(arange(seq_len, device = device), 't -> b t', b = batch)
+    else:
+        t = cast_tensor(indices, device = device, dtype = torch.long)
+        t = repeat(t, '-> b', b = batch) if t.ndim == 0 else repeat_interleave_to_match(t, batch, dim = 0)
+
+    rel = arange(-(chunk_len - 1), 1, device = device) * stride + offset
+    raw_idx = einx.add('..., c -> ... c', t, rel)
+    mask = (raw_idx >= 0) & (raw_idx < seq_len)
+
+    chunks = batched_index_select(seq, raw_idx.clamp(0, seq_len - 1), dim = 1)
+
+    if exists(pad_value):
+        chunks = where(pad_right_ndim_to(mask, chunks.ndim), chunks, pad_value)
+
+    return (chunks, mask) if return_mask else chunks
 
 # truncated geometric sampling
 
@@ -124,9 +165,10 @@ def sample_skills(
     dim_skill: int,
     *,
     device: torch.device | None = None,
-    dtype: torch.dtype = torch.float32
+    dtype: torch.dtype = torch.float32,
+    generator: torch.Generator | None = None
 ) -> Tensor:
-    return l2norm(randn((*cast_tuple(sample_shape), dim_skill), device = device, dtype = dtype))
+    return l2norm(randn((*cast_tuple(sample_shape), dim_skill), device = device, dtype = dtype, generator = generator))
 
 def effective_reward(
     anchor_embed: Tensor,
@@ -159,6 +201,54 @@ def effective_reward(
     log_partition = logits.logsumexp(dim = -1) - math.log(num_samples)
 
     return pos - partition_weight * log_partition
+
+# empowerment estimation
+
+def estimate_empowerment(
+    state: Tensor,
+    value_fn: Callable[..., Tensor | tuple[Tensor, ...]],
+    dim_skill: int,
+    *,
+    num_skills: int = 8,
+    policy: Callable[..., Tensor | tuple[Tensor, ...]] | None = None,
+    anchor: Tensor | None = None,
+    skills: Tensor | None = None,
+    discount: float = 0.,
+    clamp_min: float | None = None
+) -> Tensor:
+    anchor = default(anchor, state)
+    batch = size(state, '[b] ...')
+
+    if not exists(skills):
+        skills = sample_skills((batch, num_skills), dim_skill, **dd(state))
+    elif skills.ndim == 2:
+        skills = repeat(skills, 'k d -> b k d', b = batch)
+
+    k = size(skills, 'b [k] d', b = batch, d = dim_skill)
+
+    state, anchor = (repeat(t, 'b ... -> (b k) ...', k = k) for t in (state, anchor))
+    skills = rearrange(skills, 'b k d -> (b k) d')
+
+    args = (state, anchor, skills)
+
+    if exists(policy):
+        action, *_ = cast_tuple(policy(*args))
+        args = (*args, action)
+
+    values = value_fn(*args)
+
+    if isinstance(values, tuple):
+        values = einx.min('[c] ...', stack(values))
+
+    if values.ndim == 2:
+        values = einx.max('n [a]', values)
+
+    # main contribution - eq. (7)-(9), appendix A.3.2
+    # average skill values anchored at the current state over randomly sampled skills to lower-bound potential empowerment
+
+    empowerment = einx.mean('(b [k]) -> b', values, b = batch) * (1. - discount)
+
+    return clamp(empowerment, lo = clamp_min)
 
 # classes
 
@@ -226,19 +316,26 @@ class SkillClassifier(Module):
         state_encoder: Module,
         total_steps: int,
         *,
+        action_encoder: Module | None = None,
         anneal_fracs: tuple[float, float] = (0.3, 0.8),
         temperature: float = 0.1,
         noise_std: float = 0.,
+        action_noise_std: float | None = None,
         num_samples: int = 1024,
-        extract_obs: Callable[[Tensor], Tensor] | None = None
+        extract_obs: Callable[[Tensor], Tensor] | None = None,
+        extract_action: Callable[[Tensor], Tensor] | None = None
     ):
         super().__init__()
-        assert noise_std >= 0.
+        action_noise_std = default(action_noise_std, noise_std)
+        assert noise_std >= 0. and action_noise_std >= 0.
 
         self.state_encoder = state_encoder
+        self.action_encoder = action_encoder
         self.temperature = temperature
         self.noise_std = noise_std
+        self.action_noise_std = action_noise_std
         self.extract_obs = default(extract_obs, identity)
+        self.extract_action = default(extract_action, identity)
 
         self.effective_reward = EffectiveReward(
             total_steps = total_steps,
@@ -258,7 +355,9 @@ class SkillClassifier(Module):
     def encode_state(
         self,
         state: Tensor,
+        actions: Tensor | None = None,
         *,
+        action_mask: Tensor | None = None,
         add_noise: bool = False
     ) -> Tensor:
         state = self.extract_obs(state)
@@ -266,7 +365,28 @@ class SkillClassifier(Module):
         if add_noise and self.noise_std > 0.:
             state = state + randn_like(state) * self.noise_std
 
-        return self.state_encoder(state)
+        if not exists(actions):
+            return self.state_encoder(state)
+
+        actions = self.extract_action(actions)
+
+        if add_noise and self.action_noise_std > 0.:
+            actions = actions + randn_like(actions) * self.action_noise_std
+
+        if exists(action_mask):
+            actions = where(pad_right_ndim_to(action_mask, actions.ndim), actions, 0.)
+
+        if not exists(self.action_encoder):
+            return self.state_encoder(state, actions)
+
+        state_embed = self.state_encoder(state)
+        action_embed = self.action_encoder(actions)
+
+        if exists(action_mask):
+            has_action = einx.any('... [c]', action_mask) if action_mask.ndim >= action_embed.ndim else action_mask
+            action_embed = where(pad_right_ndim_to(has_action, action_embed.ndim), action_embed, 0.)
+
+        return state_embed + action_embed
 
     @torch.no_grad()
     def reward(
@@ -275,11 +395,15 @@ class SkillClassifier(Module):
         next_state: Tensor,
         skill: Tensor,
         *,
+        anchor_actions: Tensor | None = None,
+        next_actions: Tensor | None = None,
+        anchor_action_mask: Tensor | None = None,
+        next_action_mask: Tensor | None = None,
         partition_weight: float | None = None,
         increment_step: bool | int = True
     ) -> Tensor:
-        anchor_embed = self.encode_state(anchor)
-        next_embed = self.encode_state(next_state)
+        anchor_embed = self.encode_state(anchor, anchor_actions, action_mask = anchor_action_mask)
+        next_embed = self.encode_state(next_state, next_actions, action_mask = next_action_mask)
 
         return self.effective_reward(
             anchor_embed,
@@ -295,13 +419,17 @@ class SkillClassifier(Module):
         future_state: Tensor,
         skill: Tensor,
         *,
+        actions: Tensor | None = None,
+        future_actions: Tensor | None = None,
+        action_mask: Tensor | None = None,
+        future_action_mask: Tensor | None = None,
         add_noise: bool | None = None,
         return_loss: bool = True
     ) -> Tensor:
         add_noise = default(add_noise, self.training)
 
-        embed = self.encode_state(state, add_noise = add_noise)
-        future_embed = self.encode_state(future_state, add_noise = add_noise)
+        embed = self.encode_state(state, actions, action_mask = action_mask, add_noise = add_noise)
+        future_embed = self.encode_state(future_state, future_actions, action_mask = future_action_mask, add_noise = add_noise)
 
         return bilinear_contrastive(
             embed,
