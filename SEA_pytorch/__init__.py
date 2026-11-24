@@ -4,5 +4,6 @@ from SEA_pytorch.SEA import (
     bilinear_contrastive,
     sample_skills,
     effective_reward,
-    EffectiveReward
+    EffectiveReward,
+    SkillClassifier
 )

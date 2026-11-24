@@ -1,6 +1,7 @@
 import math
 import pytest
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 param = pytest.mark.parametrize
@@ -11,7 +12,8 @@ from SEA_pytorch import (
     bilinear_contrastive,
     sample_skills,
     effective_reward,
-    EffectiveReward
+    EffectiveReward,
+    SkillClassifier
 )
 
 def test_sea():
@@ -97,3 +99,48 @@ def test_effective_reward():
 
     reward_fn.set_step_(55)
     assert math.isclose(reward_fn.partition_weight, 0.5)
+
+def test_skill_classifier():
+    encoder = nn.Sequential(nn.Linear(4, 16), nn.GELU(), nn.Linear(16, 8))
+    classifier = SkillClassifier(
+        encoder,
+        total_steps = 100,
+        noise_std = 0.05,
+        num_samples = 64,
+        extract_obs = lambda s: s[..., :4]
+    )
+
+    state = torch.randn(6, 10)
+    future_state = torch.randn(6, 10)
+    skill = sample_skills(6, 8)
+
+    # contrastive loss updates state_encoder
+
+    loss = classifier(state, future_state, skill)
+    assert loss.ndim == 0
+
+    loss.backward()
+    assert all(p.grad is not None for p in encoder.parameters())
+
+    # eval mode is deterministic (no noise added)
+
+    classifier.eval()
+    logits_a = classifier(state, future_state, skill, return_loss = False)
+    logits_b = classifier(state, future_state, skill, return_loss = False)
+    assert logits_a.shape == (6,)
+    assert torch.equal(logits_a, logits_b)
+
+    # reward runs under no_grad, without noise, and delegates step schedule
+
+    classifier.train()
+    r0 = classifier.reward(state, future_state, skill, increment_step = 55)
+    assert r0.shape == (6,)
+    assert not r0.requires_grad
+    assert math.isclose(classifier.partition_weight, 0.5)
+
+    # unnoised reward with partition_weight = 0 matches clean logits
+
+    assert torch.allclose(r0, logits_a)
+
+    classifier.set_step_(80)
+    assert classifier.partition_weight == 1.

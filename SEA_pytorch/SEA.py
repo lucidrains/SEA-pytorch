@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
-from torch import nn, arange, cat, is_tensor, rand, randn, tensor, where, Tensor
+from torch import nn, arange, cat, is_tensor, rand, randn, randn_like, tensor, where, Tensor
 from torch.nn import Module, ModuleList
 import torch.nn.functional as F
 
@@ -21,6 +22,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def identity(t):
+    return t
 
 def cast_tuple(t, length = 1):
     return t if isinstance(t, tuple) else ((t,) * length)
@@ -215,6 +219,97 @@ class EffectiveReward(Module):
             self.step += int(increment_step)
 
         return reward
+
+class SkillClassifier(Module):
+    def __init__(
+        self,
+        state_encoder: Module,
+        total_steps: int,
+        *,
+        anneal_fracs: tuple[float, float] = (0.3, 0.8),
+        temperature: float = 0.1,
+        noise_std: float = 0.,
+        num_samples: int = 1024,
+        extract_obs: Callable[[Tensor], Tensor] | None = None
+    ):
+        super().__init__()
+        assert noise_std >= 0.
+
+        self.state_encoder = state_encoder
+        self.temperature = temperature
+        self.noise_std = noise_std
+        self.extract_obs = default(extract_obs, identity)
+
+        self.effective_reward = EffectiveReward(
+            total_steps = total_steps,
+            anneal_fracs = anneal_fracs,
+            temperature = temperature,
+            num_samples = num_samples
+        )
+
+    @property
+    def partition_weight(self) -> float:
+        return self.effective_reward.partition_weight
+
+    def set_step_(self, step: int):
+        self.effective_reward.set_step_(step)
+        return self
+
+    def encode_state(
+        self,
+        state: Tensor,
+        *,
+        add_noise: bool = False
+    ) -> Tensor:
+        state = self.extract_obs(state)
+
+        if add_noise and self.noise_std > 0.:
+            state = state + randn_like(state) * self.noise_std
+
+        return self.state_encoder(state)
+
+    @torch.no_grad()
+    def reward(
+        self,
+        anchor: Tensor,
+        next_state: Tensor,
+        skill: Tensor,
+        *,
+        partition_weight: float | None = None,
+        increment_step: bool | int = True
+    ) -> Tensor:
+        anchor_embed = self.encode_state(anchor)
+        next_embed = self.encode_state(next_state)
+
+        return self.effective_reward(
+            anchor_embed,
+            next_embed,
+            skill,
+            partition_weight = partition_weight,
+            increment_step = increment_step
+        )
+
+    def forward(
+        self,
+        state: Tensor,
+        future_state: Tensor,
+        skill: Tensor,
+        *,
+        add_noise: bool | None = None,
+        return_loss: bool = True
+    ) -> Tensor:
+        add_noise = default(add_noise, self.training)
+
+        embed = self.encode_state(state, add_noise = add_noise)
+        future_embed = self.encode_state(future_state, add_noise = add_noise)
+
+        return bilinear_contrastive(
+            embed,
+            future_embed,
+            skill,
+            temperature = self.temperature,
+            return_loss = return_loss
+        )
 
 class SEA(Module):
     def __init__(
