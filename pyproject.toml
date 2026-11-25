@@ -35,7 +35,9 @@ Homepage = "https://pypi.org/project/SEA-pytorch/"
 Repository = "https://github.com/lucidrains/SEA-pytorch"
 
 [project.optional-dependencies]
-examples = []
+examples = [
+    "fire"
+]
 test = [
     "pytest"
 ]

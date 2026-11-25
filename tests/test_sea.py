@@ -4,6 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
+from torch_einops_utils import trainable_parameters
 
 param = pytest.mark.parametrize
 
@@ -16,7 +17,11 @@ from SEA_pytorch import (
     effective_reward,
     estimate_empowerment,
     EffectiveReward,
-    SkillClassifier
+    SkillClassifier,
+    SIGReg,
+    ReservoirEpiplexity,
+    StateCompressor,
+    CompressorLossBreakdown
 )
 
 def test_sea():
@@ -265,3 +270,163 @@ def test_estimate_empowerment():
     chunks = torch.randn(B, 5, D_s)
     v_fn = lambda s, s0, z: (s.mean(dim = -2)[:, :D_z] * z).sum(dim = -1)
     assert estimate_empowerment(chunks, v_fn, D_z, num_skills = 8).shape == (B,)
+
+@param('custom_reservoir', (False, True))
+@param('channel_first', (False, True))
+@param('use_loo', (False, True))
+def test_reservoir_epiplexity(custom_reservoir, channel_first, use_loo):
+    torch.manual_seed(0)
+
+    dim_data, dim_target, batch = 8, 4, 256
+    if custom_reservoir:
+        reservoir = nn.Sequential(nn.Conv1d(dim_data, 32, 3, padding = 1), nn.ELU()) if channel_first else nn.Sequential(nn.Linear(dim_data, 32), nn.ELU())
+    else:
+        reservoir = None
+
+    reg = ReservoirEpiplexity(dim_data = dim_data, reservoir = reservoir, channel_first = channel_first, use_loo = use_loo)
+
+    if channel_first:
+        data = torch.randn(16, dim_data, 16, requires_grad = True)
+        w = torch.randn(dim_data, dim_target)
+        structured = torch.einsum('n d l, d e -> n e l', data, w)
+        noise = torch.randn(16, dim_target, 16)
+        dark = torch.zeros(16, dim_target, 16)
+    else:
+        data = torch.randn(batch, dim_data, requires_grad = True)
+        structured = data @ torch.randn(dim_data, dim_target)
+        noise = torch.randn(batch, dim_target)
+        dark = torch.zeros(batch, dim_target)
+
+    structured_score, noise_score, dark_score = (reg(data, target) for target in (structured, noise, dark))
+
+    assert structured_score > noise_score
+    assert (noise_score <= dark_score) if use_loo else (noise_score > dark_score)
+    assert dark_score.item() == 0.
+
+    structured_score.backward()
+    assert data.grad is not None and torch.isfinite(data.grad).all()
+    assert all(p.grad is None for p in reg.reservoir.parameters())
+
+    # bf16 autocast safety
+    bf16_score = reg(data.detach(), structured.detach().bfloat16())
+    assert bf16_score.dtype == torch.float32 and torch.isfinite(bf16_score)
+
+def test_reservoir_epiplexity_gradcheck():
+    torch.manual_seed(0)
+    reg = ReservoirEpiplexity(dim_data = 4, mlp_reservoir_dim = 8, use_loo = True).double()
+    for n, d in ((12, 2), (12, 6)):
+        x = torch.randn(n, 4, dtype = torch.float64, requires_grad = True)
+        y = torch.randn(n, d, dtype = torch.float64, requires_grad = True)
+        assert torch.autograd.gradcheck(lambda a, b: reg(a, b), (x, y), eps = 1e-6, atol = 1e-4)
+
+def test_sigreg():
+    reg = SIGReg(num_slices = 128, num_knots = 17, t_max = 3.)
+    gen = torch.Generator().manual_seed(0)
+
+    gauss = torch.randn(512, 8, generator = gen, requires_grad = True)
+    collapsed = torch.zeros(512, 8)
+    scaled = torch.randn(512, 8, generator = gen) * 5.
+
+    l_gauss = reg(gauss, generator = torch.Generator().manual_seed(1))
+    l_collapsed = reg(collapsed, generator = torch.Generator().manual_seed(1))
+    l_scaled = reg(scaled, generator = torch.Generator().manual_seed(1))
+
+    assert l_gauss.ndim == 0 and l_gauss < l_collapsed and l_gauss < l_scaled
+
+    seq = gauss.detach().unsqueeze(1).expand(-1, 5, -1)
+    assert torch.allclose(reg(seq, generator = torch.Generator().manual_seed(1)), l_gauss, atol = 1e-4)
+
+    l_gauss.backward()
+    assert gauss.grad is not None
+
+@param('regularizer, dynamics_loss_weight', (('epiplexity', 1.), ('epiplexity', 0.), ('sigreg', 1.)))
+def test_state_compressor(regularizer, dynamics_loss_weight):
+    B, H, D_lat, D_act = 24, 4, 4, 2
+    cnn = nn.Sequential(nn.Conv2d(1, 8, 4, 2, 1), nn.GELU(), nn.Flatten(), nn.Linear(8 * 6 * 6, 32), nn.GELU())
+    comp = StateCompressor(
+        cnn,
+        dim_latent = D_lat,
+        dim_encoder_out = 32,
+        dim_action = D_act if dynamics_loss_weight > 0. else None,
+        obs_ndim = 3,
+        regularizer = regularizer,
+        dynamics_loss_weight = dynamics_loss_weight
+    )
+
+    obs_seq = torch.randn(B, H + 1, 1, 12, 12)
+    actions = torch.randn(B, H, D_act) if dynamics_loss_weight > 0. else None
+    mask = torch.ones(B, H, dtype = torch.bool)
+    mask[:, -1] = False
+
+    loss, breakdown = comp.loss(obs_seq, actions, mask = mask, return_breakdown = True)
+    assert loss.ndim == 0 and isinstance(breakdown, CompressorLossBreakdown)
+    loss.backward()
+
+    assert all(p.grad is not None for p in trainable_parameters(comp))
+    if regularizer == 'epiplexity':
+        assert all(p.grad is None for p in comp.regularizer.reservoir.parameters())
+
+    lat = comp(obs_seq[:, 0])
+    assert lat.shape == (B, D_lat)
+    if regularizer == 'epiplexity':
+        assert torch.allclose(lat.norm(dim = -1), torch.full((B,), math.sqrt(D_lat)), atol = 1e-4)
+
+    chunk_lat = comp.encode_detached(obs_seq[:, :3])
+    assert chunk_lat.shape == (B, 3, D_lat) and not chunk_lat.requires_grad
+
+    if dynamics_loss_weight > 0.:
+        assert comp.rollout(lat, actions).shape == (B, H, D_lat)
+
+def test_state_compressor_discrete_actions():
+    B, H, D_lat = 16, 3, 4
+    comp = StateCompressor(nn.Linear(10, D_lat), dim_latent = D_lat, num_discrete_actions = 5, obs_ndim = 1)
+    loss = comp(torch.randn(B, H + 1, 10), torch.randint(0, 5, (B, H)))
+    assert loss.ndim == 0
+    loss.backward()
+    assert comp.to_action_embed.weight.grad is not None
+
+@param('regularizer', ('epiplexity', 'sigreg'))
+def test_skill_classifier_swappable_state_compressor(regularizer):
+    B, D_lat, D_z = 8, 6, 4
+    obs = torch.randn(B, 1, 12, 12)
+    future_obs = torch.randn(B, 1, 12, 12)
+    skill = sample_skills(B, D_z)
+
+    cnn = nn.Sequential(nn.Conv2d(1, 8, 4, 2, 1), nn.GELU(), nn.Flatten(), nn.Linear(8 * 6 * 6, 16))
+    comp = StateCompressor(cnn, dim_latent = D_lat, dim_encoder_out = 16, dim_action = 2, obs_ndim = 3, regularizer = regularizer)
+    comp.eval()
+
+    clf = SkillClassifier(
+        nn.Linear(D_lat, D_z),
+        total_steps = 100,
+        noise_std = 0.1,
+        num_samples = 32,
+        state_compressor = comp
+    )
+
+    # detached by default: compressor params excluded from classifier.parameters() and eval mode preserved
+
+    clf_param_ids = {id(p) for p in clf.parameters()}
+    assert all(id(p) not in clf_param_ids for p in comp.parameters())
+    clf.train()
+    assert not comp.training
+
+    loss = clf(obs, future_obs, skill)
+    loss.backward()
+    assert all(p.grad is None for p in comp.parameters())
+    assert clf.state_encoder.weight.grad is not None
+    assert clf.reward(obs, future_obs, skill, increment_step = False).shape == (B,)
+
+    # attach compressor end-to-end (gradients flow through state_compressor)
+
+    alt_compressor = nn.Sequential(nn.Flatten(), nn.Linear(144, D_lat))
+    clf_alt = SkillClassifier(
+        nn.Linear(D_lat, D_z),
+        total_steps = 100,
+        noise_std = 0.1,
+        num_samples = 32,
+        state_compressor = alt_compressor,
+        detach_state_compressor = False
+    )
+    clf_alt(obs, future_obs, skill).backward()
+    assert alt_compressor[1].weight.grad is not None

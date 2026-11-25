@@ -9,3 +9,11 @@ from SEA_pytorch.SEA import (
     EffectiveReward,
     SkillClassifier
 )
+
+from SEA_pytorch.state_compressor import (
+    SIGReg,
+    logdet_epiplexity,
+    ReservoirEpiplexity,
+    StateCompressor,
+    CompressorLossBreakdown
+)

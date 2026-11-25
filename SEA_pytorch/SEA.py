@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from contextlib import nullcontext
 
 import torch
 from torch import nn, arange, cat, is_tensor, rand, randn, randn_like, stack, tensor, where, Tensor
@@ -323,7 +324,9 @@ class SkillClassifier(Module):
         action_noise_std: float | None = None,
         num_samples: int = 1024,
         extract_obs: Callable[[Tensor], Tensor] | None = None,
-        extract_action: Callable[[Tensor], Tensor] | None = None
+        extract_action: Callable[[Tensor], Tensor] | None = None,
+        state_compressor: Callable[[Tensor], Tensor] | None = None,
+        detach_state_compressor: bool = True
     ):
         super().__init__()
         action_noise_std = default(action_noise_std, noise_std)
@@ -336,6 +339,18 @@ class SkillClassifier(Module):
         self.action_noise_std = action_noise_std
         self.extract_obs = default(extract_obs, identity)
         self.extract_action = default(extract_action, identity)
+        self.detach_state_compressor = detach_state_compressor
+
+        # keep detached compressors out of _modules so classifier optimizers and .train() don't touch them
+
+        self._detached_state_compressor = None
+        self._attached_state_compressor = None
+
+        if exists(state_compressor):
+            if detach_state_compressor:
+                self._detached_state_compressor = (state_compressor,)
+            else:
+                self._attached_state_compressor = state_compressor
 
         self.effective_reward = EffectiveReward(
             total_steps = total_steps,
@@ -343,6 +358,10 @@ class SkillClassifier(Module):
             temperature = temperature,
             num_samples = num_samples
         )
+
+    @property
+    def state_compressor(self) -> Callable[[Tensor], Tensor] | None:
+        return self._detached_state_compressor[0] if exists(self._detached_state_compressor) else self._attached_state_compressor
 
     @property
     def partition_weight(self) -> float:
@@ -361,6 +380,12 @@ class SkillClassifier(Module):
         add_noise: bool = False
     ) -> Tensor:
         state = self.extract_obs(state)
+
+        compressor = self.state_compressor
+        if exists(compressor):
+            context = torch.no_grad if self.detach_state_compressor else nullcontext
+            with context():
+                state = compressor(state)
 
         if add_noise and self.noise_std > 0.:
             state = state + randn_like(state) * self.noise_std
