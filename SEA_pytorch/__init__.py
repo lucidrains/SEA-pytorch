@@ -17,3 +17,9 @@ from SEA_pytorch.state_compressor import (
     StateCompressor,
     CompressorLossBreakdown
 )
+
+from SEA_pytorch.planner import (
+    latent_goal_score,
+    CEMPlan,
+    CEMPlanner
+)

@@ -21,7 +21,10 @@ from SEA_pytorch import (
     SIGReg,
     ReservoirEpiplexity,
     StateCompressor,
-    CompressorLossBreakdown
+    CompressorLossBreakdown,
+    latent_goal_score,
+    CEMPlan,
+    CEMPlanner
 )
 
 def test_sea():
@@ -430,3 +433,82 @@ def test_skill_classifier_swappable_state_compressor(regularizer):
     )
     clf_alt(obs, future_obs, skill).backward()
     assert alt_compressor[1].weight.grad is not None
+
+def test_state_compressor_deep_predictor_sigreg():
+    torch.manual_seed(0)
+    B, H, D_obs, D_lat, D_act = 32, 6, 8, 16, 2
+    enc = nn.Sequential(nn.Linear(D_obs, 64), nn.LayerNorm(64), nn.GELU(), nn.Linear(64, D_lat))
+    wm = StateCompressor(
+        enc,
+        dim_latent = D_lat,
+        dim_action = D_act,
+        predictor_hidden_dim = 64,
+        predictor_depth = 2,
+        predictor_layernorm = True,
+        obs_ndim = 1,
+        regularizer = 'sigreg',
+        reg_weight = 0.1,
+        rollout_discount = 0.95,
+        l2norm_latent = False
+    )
+    obs_seq = torch.randn(B, H + 1, D_obs)
+    actions = torch.randn(B, H, D_act)
+    loss, bd = wm.loss(obs_seq, actions, return_breakdown = True)
+    assert loss.ndim == 0 and isinstance(bd, CompressorLossBreakdown)
+    loss.backward()
+    assert all(p.grad is not None for p in trainable_parameters(wm))
+    assert wm.rollout(wm.encode_detached(obs_seq[:, 0]), actions).shape == (B, H, D_lat)
+
+def test_skill_classifier_sigreg():
+    torch.manual_seed(0)
+    B, D_obs, D_z = 32, 6, 4
+    clf = SkillClassifier(
+        nn.Linear(D_obs, D_z),
+        total_steps = 50,
+        temperature = 0.1,
+        noise_std = 0.05,
+        num_samples = 32,
+        sigreg_weight = 0.05
+    )
+    s0, sf = torch.randn(B, D_obs), torch.randn(B, D_obs)
+    z = sample_skills(B, D_z)
+    loss = clf(s0, sf, z)
+    assert loss.ndim == 0 and clf.sigreg is not None
+    loss.backward()
+    assert clf.state_encoder.weight.grad is not None
+
+def test_cem_planner():
+    torch.manual_seed(0)
+    # Exact linear integrator world model: z_{t+1} = z_t + 0.25 * a_t
+    class LinearWM(nn.Module):
+        def encode_detached(self, obs):
+            return obs
+        def rollout(self, z, actions):
+            preds = []
+            for a in actions.unbind(dim = 1):
+                z = z + 0.25 * a
+                preds.append(z)
+            return torch.stack(preds, dim = 1)
+
+    wm = LinearWM()
+    planner = CEMPlanner(wm, dim_action = 2, horizon = 6, pop_size = 128, generations = 4, elite_frac = 0.1, action_range = (-1., 1.))
+
+    # Unbatched pure latent goal reaching: start at (0, 0), goal at (1, -0.5)
+    obs0 = torch.tensor([0., 0.])
+    goal = torch.tensor([1., -0.5])
+    res = planner(obs0, obs_goal = goal, generator = torch.Generator().manual_seed(0))
+    assert isinstance(res, CEMPlan) and res.action.shape == (2,) and res.mean.shape == (6, 2)
+    assert (res.mean.abs() <= 1.0 + 1e-6).all()
+    end_z = wm.rollout(obs0[None], res.mean[None])[0, -1]
+    assert (end_z - goal).norm().item() < 0.1
+
+    # Batched planning + warm-start shift + custom score_fn
+    z_cur = torch.zeros(4, 2)
+    z_goal = torch.tensor([[1., 0.], [0., 1.], [-1., 0.], [0., -1.]])
+    res_b = planner.plan_to_latent(z_cur, z_goal, generator = torch.Generator().manual_seed(1))
+    assert res_b.action.shape == (4, 2) and res_b.mean.shape == (4, 6, 2)
+    shifted = planner.shift_warm_start(res_b.mean, commit_k = 2)
+    assert shifted.shape == (4, 6, 2) and (shifted[:, -2:] == 0.).all()
+
+    res_custom = planner.plan_obs(z_cur, score_fn = lambda seq: latent_goal_score(seq, z_goal), warm_mean = shifted)
+    assert res_custom.action.shape == (4, 2)

@@ -236,7 +236,10 @@ class StateCompressor(Module):
         num_discrete_actions: int | None = None,
         dim_action_embed: int | None = None,
         dim_encoder_out: int | None = None,
+        predictor: Module | None = None,
         predictor_hidden_dim: int = 64,
+        predictor_depth: int = 1,
+        predictor_layernorm: bool = False,
         obs_ndim: int | None = None,
         regularizer: Literal['epiplexity', 'sigreg'] = 'epiplexity',
         dynamics_loss_weight: float = 1.,
@@ -247,7 +250,7 @@ class StateCompressor(Module):
     ):
         super().__init__()
         assert regularizer in ('epiplexity', 'sigreg')
-        assert dim_latent >= 1 and dynamics_loss_weight >= 0. and 0. < rollout_discount <= 1.
+        assert dim_latent >= 1 and dynamics_loss_weight >= 0. and 0. < rollout_discount <= 1. and predictor_depth >= 1
         assert not (exists(dim_action) and exists(num_discrete_actions))
 
         self.dim_latent = dim_latent
@@ -279,14 +282,21 @@ class StateCompressor(Module):
             eff_dim_action = dim_action
             self.to_action_embed = None
 
-        self.predictor = (
-            Sequential(
-                Linear(dim_latent + eff_dim_action, predictor_hidden_dim),
-                nn.GELU(),
-                Linear(predictor_hidden_dim, dim_latent)
-            )
-            if (dynamics_loss_weight > 0. and exists(eff_dim_action)) else None
-        )
+        if exists(predictor):
+            self.predictor = predictor
+        elif dynamics_loss_weight > 0. and exists(eff_dim_action):
+            pred_layers: list[Module] = []
+            d = dim_latent + eff_dim_action
+            for _ in range(predictor_depth):
+                pred_layers.append(Linear(d, predictor_hidden_dim))
+                if predictor_layernorm:
+                    pred_layers.append(LayerNorm(predictor_hidden_dim))
+                pred_layers.append(nn.GELU())
+                d = predictor_hidden_dim
+            pred_layers.append(Linear(d, dim_latent))
+            self.predictor = Sequential(*pred_layers)
+        else:
+            self.predictor = None
 
     def _normalize(self, z: Tensor) -> Tensor:
         return (l2norm(z) * sqrt(self.dim_latent)) if self.l2norm_latent else z

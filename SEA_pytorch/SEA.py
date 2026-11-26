@@ -23,6 +23,8 @@ from torch_einops_utils import (
 )
 from torch_einops_utils.shape import size, shape
 
+from SEA_pytorch.state_compressor import SIGReg
+
 # functions
 
 def exists(v):
@@ -323,6 +325,8 @@ class SkillClassifier(Module):
         noise_std: float = 0.,
         action_noise_std: float | None = None,
         num_samples: int = 1024,
+        sigreg_weight: float = 0.,
+        sigreg_scale: float | None = None,
         extract_obs: Callable[[Tensor], Tensor] | None = None,
         extract_action: Callable[[Tensor], Tensor] | None = None,
         state_compressor: Callable[[Tensor], Tensor] | None = None,
@@ -330,13 +334,16 @@ class SkillClassifier(Module):
     ):
         super().__init__()
         action_noise_std = default(action_noise_std, noise_std)
-        assert noise_std >= 0. and action_noise_std >= 0.
+        assert noise_std >= 0. and action_noise_std >= 0. and sigreg_weight >= 0.
 
         self.state_encoder = state_encoder
         self.action_encoder = action_encoder
         self.temperature = temperature
         self.noise_std = noise_std
         self.action_noise_std = action_noise_std
+        self.sigreg_weight = sigreg_weight
+        self.sigreg_scale = default(sigreg_scale, 2. * temperature)
+        self.sigreg = SIGReg() if sigreg_weight > 0. else None
         self.extract_obs = default(extract_obs, identity)
         self.extract_action = default(extract_action, identity)
         self.detach_state_compressor = detach_state_compressor
@@ -456,13 +463,20 @@ class SkillClassifier(Module):
         embed = self.encode_state(state, actions, action_mask = action_mask, add_noise = add_noise)
         future_embed = self.encode_state(future_state, future_actions, action_mask = future_action_mask, add_noise = add_noise)
 
-        return bilinear_contrastive(
+        loss = bilinear_contrastive(
             embed,
             future_embed,
             skill,
             temperature = self.temperature,
             return_loss = return_loss
         )
+
+        if return_loss and exists(self.sigreg):
+            clean_a = self.encode_state(state, actions, action_mask = action_mask, add_noise = False) if add_noise else embed
+            clean_f = self.encode_state(future_state, future_actions, action_mask = future_action_mask, add_noise = False) if add_noise else future_embed
+            loss = loss + self.sigreg_weight * self.sigreg(cat((clean_a, clean_f), dim = 0) / self.sigreg_scale)
+
+        return loss
 
 class SEA(Module):
     def __init__(
